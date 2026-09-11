@@ -134,3 +134,81 @@ final class TrimTests: XCTestCase {
         XCTAssertEqual(tracks.count, 1)
     }
 }
+
+// MARK: - Uncompressed output
+
+/// The formats that must NOT go through an export session.
+///
+/// `AVAssetExportPresetAppleM4A` supports only `com.apple.m4a-audio` and
+/// `com.apple.quicktime-audio`; handing `setOutputFileType:` a WAV type raises
+/// an Objective-C exception, which in Swift is not a thrown error but a dead
+/// process. These cases would have caught that, and did not exist when it
+/// shipped — the crash was found by pointing a CLI at a real MP3.
+final class PCMExportTests: XCTestCase {
+
+    /// A real two-second sine in a WAV, written through AVAudioFile.
+    ///
+    /// Not ``TestAudio/mp3Stream(frames:)``: those frames carry valid MPEG
+    /// headers over an empty payload, which is exactly right for testing the
+    /// frame parser and gives a decoder nothing to produce. Measuring what
+    /// comes out the far end of a decode needs audio that actually decodes.
+    private func sineSource() throws -> URL {
+        let rate = 44_100.0
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-pcm-\(UUID().uuidString).wav")
+        let format = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 1)!
+        let file = try AVAudioFile(forWriting: url, settings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: rate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+        ])
+        let frames = AVAudioFrameCount(rate * 2)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+        buffer.frameLength = frames
+        let step = 2 * Double.pi * 440 / rate
+        for i in 0..<Int(frames) {
+            buffer.floatChannelData![0][i] = Float(sin(step * Double(i)))
+        }
+        try file.write(from: buffer)
+        return url
+    }
+
+    private func trim(to ext: String) async throws -> TrimResult {
+        let source = try sineSource()
+        defer { try? FileManager.default.removeItem(at: source) }
+        // A distinct base name: the source is itself a .wav, so reusing it
+        // would ask the trimmer to overwrite the file it is reading.
+        let destination = source.deletingLastPathComponent()
+            .appendingPathComponent("out-\(UUID().uuidString)")
+            .appendingPathExtension(ext)
+        return try await Trimmer.trim(source, to: destination, start: 0, duration: 1, overwrite: true)
+    }
+
+    func testWritesWavWithoutCrashing() async throws {
+        let result = try await trim(to: "wav")
+        defer { try? FileManager.default.removeItem(at: result.url) }
+        XCTAssertGreaterThan(result.byteCount, 0)
+        XCTAssertFalse(result.lossless, "PCM output is decoded and re-encoded")
+        XCTAssertGreaterThan(result.duration, 0)
+    }
+
+    func testWritesAiffAndCaf() async throws {
+        for ext in ["aiff", "caf"] {
+            let result = try await trim(to: ext)
+            defer { try? FileManager.default.removeItem(at: result.url) }
+            XCTAssertGreaterThan(result.byteCount, 0, "\(ext) produced an empty file")
+        }
+    }
+
+    func testTheWrittenFileIsReadableAudio() async throws {
+        // A file that exists and cannot be opened is the failure this misses if
+        // it only checks the byte count.
+        let result = try await trim(to: "wav")
+        defer { try? FileManager.default.removeItem(at: result.url) }
+        let file = try AVAudioFile(forReading: result.url)
+        XCTAssertGreaterThan(file.length, 0)
+        XCTAssertEqual(file.processingFormat.sampleRate, 44_100, accuracy: 1)
+    }
+}

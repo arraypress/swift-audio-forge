@@ -61,7 +61,25 @@ public enum Trimmer {
             return try copyFrames(source, to: destination, start: start, duration: duration)
         }
         guard outFormat.canEncode else { throw AudioForgeError.unsupportedOutput(outFormat) }
-        return try await export(source, to: destination, start: start, duration: duration, format: outFormat)
+
+        // Two different writers, because one API cannot do both. PCM containers
+        // go through AVAudioFile; an export session refuses them at runtime with
+        // an uncatchable exception — see ``exportPCM``.
+        switch outFormat {
+        case .wav, .caf:
+            return try exportPCM(source, to: destination, start: start, duration: duration,
+                                 bigEndian: false)
+        case .aiff:
+            return try exportPCM(source, to: destination, start: start, duration: duration,
+                                 bigEndian: true)
+        case .m4a, .m4r:
+            return try await export(source, to: destination, start: start, duration: duration,
+                                    format: outFormat)
+        case .mp3:
+            // Unreachable: mp3→mp3 took the copy road above, and canEncode is
+            // false for mp3, so the guard has already thrown.
+            throw AudioForgeError.unsupportedOutput(outFormat)
+        }
     }
 
     // MARK: - The copy road
@@ -103,7 +121,75 @@ public enum Trimmer {
 
     // MARK: - The decode road
 
-    /// Everything else: a time-ranged export, sample-exact and re-encoded.
+    /// Uncompressed output: read the samples and write them straight out.
+    ///
+    /// `AVAssetExportSession` CANNOT do this, and finding that out at runtime is
+    /// ugly: `AVAssetExportPresetAppleM4A` supports exactly two output types —
+    /// `com.apple.m4a-audio` and `com.apple.quicktime-audio` — and handing
+    /// `setOutputFileType:` anything else raises an Objective-C exception that
+    /// `try`/`catch` cannot see, so the process dies rather than throwing. (The
+    /// full list in ``AudioFormat`` was measured against `AVAssetWriter`, which
+    /// is a different class; the code used an export session.) PCM belongs to
+    /// `AVAudioFile` anyway, which writes the container the extension names.
+    ///
+    /// Output is 16-bit: universal, what every DAW and sampler expects, and a
+    /// truthful ceiling for a source that was lossy to begin with.
+    private static func exportPCM(_ source: URL,
+                                  to destination: URL,
+                                  start: Double,
+                                  duration: Double?,
+                                  bigEndian: Bool) throws -> TrimResult {
+        let input = try AVAudioFile(forReading: source)
+        let processing = input.processingFormat
+        let rate = processing.sampleRate
+        guard rate > 0, input.length > 0 else { throw AudioForgeError.noAudioTrack(source) }
+
+        let total = Double(input.length) / rate
+        let end = duration.map { min(start + $0, total) } ?? total
+        guard start >= 0, start < total, end > start else {
+            throw AudioForgeError.rangeOutOfBounds(requested: start...max(start, end), duration: total)
+        }
+
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: rate,
+            AVNumberOfChannelsKey: processing.channelCount,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: bigEndian,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        // The writer lives in its own scope so it is released — and the file
+        // finalised — before anything measures the result. AVAudioFile flushes
+        // its header on deinit, so reading the destination while the writer is
+        // still alive reports a file of zero frames, which reads exactly like a
+        // silent export and is not one.
+        var writtenFrames: AVAudioFramePosition = 0
+        do {
+            let output = try AVAudioFile(forWriting: destination, settings: settings)
+            input.framePosition = AVAudioFramePosition(start * rate)
+            var remaining = AVAudioFrameCount(((end - start) * rate).rounded())
+            let chunk: AVAudioFrameCount = 8192
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: processing, frameCapacity: chunk) else {
+                throw AudioForgeError.exportFailed("could not allocate a \(chunk)-frame buffer")
+            }
+            while remaining > 0 {
+                try input.read(into: buffer, frameCount: min(chunk, remaining))
+                guard buffer.frameLength > 0 else { break }   // short file; take what is there
+                try output.write(from: buffer)
+                remaining -= buffer.frameLength
+            }
+            writtenFrames = output.length
+        }
+
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? Int) ?? 0
+        return TrimResult(url: destination,
+                          duration: Double(writtenFrames) / rate,
+                          lossless: false,
+                          byteCount: bytes)
+    }
+
+    /// Compressed output: a time-ranged export, sample-exact and re-encoded.
     private static func export(_ source: URL,
                                to destination: URL,
                                start: Double,
@@ -126,16 +212,17 @@ public enum Trimmer {
                                         duration: CMTime(seconds: end - start, preferredTimescale: scale))
         // A ringtone is AAC in an MPEG-4 container; only the extension differs, so the
         // writer is told m4a and the file is simply named .m4r.
+        // Always .m4a: this path only ever handles m4a and m4r, and an m4r IS an
+        // m4a with a different extension. Handing this preset any other type
+        // raises an Objective-C exception rather than throwing.
         do {
-            try await session.export(to: destination, as: format == .wav ? .wav
-                                                       : format == .aiff ? .aiff
-                                                       : format == .caf ? .caf : .m4a)
+            try await session.export(to: destination, as: .m4a)
         } catch {
             throw AudioForgeError.exportFailed(error.localizedDescription)
         }
         let written = AVURLAsset(url: destination)
         let realDuration = try await CMTimeGetSeconds(written.load(.duration))
         let bytes = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? Int) ?? 0
-        return TrimResult(url: destination, duration: realDuration, lossless: false, byteCount: bytes ?? 0)
+        return TrimResult(url: destination, duration: realDuration, lossless: false, byteCount: bytes)
     }
 }
